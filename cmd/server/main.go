@@ -68,8 +68,8 @@ func main() {
 	if err := services.Auth.EnsureDefaultAdmin(context.Background()); err != nil {
 		log.Fatalf("init default admin failed: %v", err)
 	}
-	pollingManager := initPolling(runtimeStore, services, repos.Setting)
-	handlers := initHandlers(services, repos.Setting, settingsSvc, runtimeStore)
+	pollingManager := initPolling(runtimeStore, services)
+	handlers := initHandlers(services, settingsSvc, runtimeStore, pollingManager)
 	router := initRouter(handlers, config.GlobalConfig.Server.Mode)
 
 	addr := fmt.Sprintf(":%d", config.GlobalConfig.Server.Port)
@@ -210,13 +210,8 @@ func configureSQLiteConcurrency(db *gorm.DB, driver string) error {
 	return nil
 }
 
-func initPolling(runtime *appruntime.Store, services *Services, settingRepo *repository.SettingRepository) *polling.Manager {
+func initPolling(runtime *appruntime.Store, services *Services) *polling.Manager {
 	mgr := polling.NewManager()
-	if settingRepo != nil {
-		mgr.SetSnapshotPersister(func(ctx context.Context, snapshot polling.Snapshot) error {
-			return settingRepo.SetJSON(ctx, polling.SnapshotSettingKey, snapshot)
-		})
-	}
 
 	checkReady := func(_ context.Context) error {
 		if runtime == nil || runtime.BilibiliClient() == nil {
@@ -231,8 +226,8 @@ func initPolling(runtime *appruntime.Store, services *Services, settingRepo *rep
 
 	_ = mgr.Register(polling.Task{
 		Name:       "trend-taginfo-sync",
-		Interval:   15 * time.Minute,
-		Timeout:    180 * time.Second,
+		Interval:   30 * time.Minute,
+		Timeout:    120 * time.Second,
 		RunOnStart: true,
 		PreHandle:  checkReady,
 		Handle: func(ctx context.Context) error {
@@ -247,12 +242,12 @@ func initPolling(runtime *appruntime.Store, services *Services, settingRepo *rep
 
 	_ = mgr.Register(polling.Task{
 		Name:       "video-comments-sync",
-		Interval:   1 * time.Minute,
-		Timeout:    90 * time.Second,
+		Interval:   5 * time.Minute,
+		Timeout:    60 * time.Second,
 		RunOnStart: true,
 		PreHandle:  checkReady,
 		Handle: func(ctx context.Context) error {
-			result, err := services.Comment.SyncRecentVideoComments(ctx, 3, 1, 20)
+			result, err := services.Comment.SyncRecentVideoComments(ctx, 1, 1, 10)
 			if err == nil && result != nil {
 				log.Printf("[polling][video-comments-sync] videos=%d inserted=%d video_error=%d", result.Videos, result.Inserted, result.VideoError)
 			}
@@ -263,12 +258,12 @@ func initPolling(runtime *appruntime.Store, services *Services, settingRepo *rep
 
 	_ = mgr.Register(polling.Task{
 		Name:       "private-messages-sync",
-		Interval:   1 * time.Minute,
-		Timeout:    90 * time.Second,
+		Interval:   3 * time.Minute,
+		Timeout:    60 * time.Second,
 		RunOnStart: true,
 		PreHandle:  checkReady,
 		Handle: func(ctx context.Context) error {
-			result, err := services.Message.SyncMessages(ctx, 1, 20)
+			result, err := services.Message.SyncMessages(ctx, 1, 5)
 			if err == nil && result != nil {
 				log.Printf("[polling][private-messages-sync] sessions=%d fetched=%d inserted=%d existing=%d session_errors=%d insert_errors=%d", result.Sessions, result.Fetched, result.Inserted, result.Existing, result.SessionErrors, result.InsertErrors)
 			}
@@ -279,8 +274,8 @@ func initPolling(runtime *appruntime.Store, services *Services, settingRepo *rep
 
 	_ = mgr.Register(polling.Task{
 		Name:       "fans-weekly-interact",
-		Interval:   10 * time.Minute,
-		Timeout:    180 * time.Second,
+		Interval:   1 * time.Hour,
+		Timeout:    120 * time.Second,
 		RunOnStart: false,
 		PreHandle:  checkReady,
 		Handle: func(ctx context.Context) error {
@@ -288,7 +283,7 @@ func initPolling(runtime *appruntime.Store, services *Services, settingRepo *rep
 			if err != nil {
 				return err
 			}
-			summary, err := services.Interaction.AutoInteractRecentFanVideos(ctx, cfg.Interaction, 20)
+			summary, err := services.Interaction.AutoInteractRecentFanVideos(ctx, cfg.Interaction, 5)
 			if err == nil && summary != nil {
 				log.Printf("[polling][fans-weekly-interact] total=%d like=%d coin=%d favorite=%d", summary.TotalCount, summary.LikedCount, summary.CoinedCount, summary.FavoritedCount)
 			}
@@ -425,38 +420,38 @@ func buildHTMLRenderer(templateFS fs.FS) (render.HTMLRender, error) {
 }
 
 type Repositories struct {
-	Comment         *repository.CommentRepository
-	Message         *repository.MessageRepository
-	Interaction     *repository.InteractionRepository
-	TagRanking      *repository.TagRankingRepository
-	LLMChatLog      *repository.LLMChatLogRepository
-	Setting         *repository.SettingRepository
-	LLMProvider     *repository.LLMProviderRepository
-	AdminUser       *repository.AdminUserRepository
-	AdminSession    *repository.AdminSessionRepository
-	FanAutoReply    *repository.FanAutoReplyRecordRepository
-	ReplyTemplate   *repository.ReplyTemplateRepository
-	ReplyExample    *repository.ReplyExampleRepository
-	ReplyDraft      *repository.ReplyDraftRepository
-	MsgAutoRule     *repository.MessageAutoRuleRepository
+	Comment       *repository.CommentRepository
+	Message       *repository.MessageRepository
+	Interaction   *repository.InteractionRepository
+	TagRanking    *repository.TagRankingRepository
+	LLMChatLog    *repository.LLMChatLogRepository
+	Setting       *repository.SettingRepository
+	LLMProvider   *repository.LLMProviderRepository
+	AdminUser     *repository.AdminUserRepository
+	AdminSession  *repository.AdminSessionRepository
+	FanAutoReply  *repository.FanAutoReplyRecordRepository
+	ReplyTemplate *repository.ReplyTemplateRepository
+	ReplyExample  *repository.ReplyExampleRepository
+	ReplyDraft    *repository.ReplyDraftRepository
+	MsgAutoRule   *repository.MessageAutoRuleRepository
 }
 
 func initRepositories(db *gorm.DB) *Repositories {
 	return &Repositories{
-		Comment:         repository.NewCommentRepository(db),
-		Message:         repository.NewMessageRepository(db),
-		Interaction:     repository.NewInteractionRepository(db),
-		TagRanking:      repository.NewTagRankingRepository(db),
-		LLMChatLog:      repository.NewLLMChatLogRepository(db),
-		Setting:         repository.NewSettingRepository(db),
-		LLMProvider:     repository.NewLLMProviderRepository(db),
-		AdminUser:       repository.NewAdminUserRepository(db),
-		AdminSession:    repository.NewAdminSessionRepository(db),
-		FanAutoReply:    repository.NewFanAutoReplyRecordRepository(db),
-		ReplyTemplate:   repository.NewReplyTemplateRepository(db),
-		ReplyExample:    repository.NewReplyExampleRepository(db),
-		ReplyDraft:      repository.NewReplyDraftRepository(db),
-		MsgAutoRule:     repository.NewMessageAutoRuleRepository(db),
+		Comment:       repository.NewCommentRepository(db),
+		Message:       repository.NewMessageRepository(db),
+		Interaction:   repository.NewInteractionRepository(db),
+		TagRanking:    repository.NewTagRankingRepository(db),
+		LLMChatLog:    repository.NewLLMChatLogRepository(db),
+		Setting:       repository.NewSettingRepository(db),
+		LLMProvider:   repository.NewLLMProviderRepository(db),
+		AdminUser:     repository.NewAdminUserRepository(db),
+		AdminSession:  repository.NewAdminSessionRepository(db),
+		FanAutoReply:  repository.NewFanAutoReplyRecordRepository(db),
+		ReplyTemplate: repository.NewReplyTemplateRepository(db),
+		ReplyExample:  repository.NewReplyExampleRepository(db),
+		ReplyDraft:    repository.NewReplyDraftRepository(db),
+		MsgAutoRule:   repository.NewMessageAutoRuleRepository(db),
 	}
 }
 
@@ -500,7 +495,11 @@ type Handlers struct {
 	Auth           *handler.AuthHandler
 }
 
-func initHandlers(services *Services, settingRepo *repository.SettingRepository, settings *service.AppSettingsService, runtime *appruntime.Store) *Handlers {
+func initHandlers(services *Services, settings *service.AppSettingsService, runtime *appruntime.Store, pollingManager *polling.Manager) *Handlers {
+	var pollingSnapshot func() polling.Snapshot
+	if pollingManager != nil {
+		pollingSnapshot = pollingManager.Snapshot
+	}
 	return &Handlers{
 		Page:           handler.NewPageHandler(),
 		Dashboard:      handler.NewDashboardHandler(services.Dashboard),
@@ -511,7 +510,7 @@ func initHandlers(services *Services, settingRepo *repository.SettingRepository,
 		LLM:            handler.NewLLMHandler(services.LLM),
 		ReplyWorkspace: handler.NewReplyWorkspaceHandler(services.ReplyWorkspace),
 		Settings:       handler.NewSettingsHandler(settings, runtime),
-		Observability:  handler.NewObservabilityHandler(settingRepo),
+		Observability:  handler.NewObservabilityHandler(pollingSnapshot),
 		Auth:           handler.NewAuthHandler(services.Auth),
 	}
 }

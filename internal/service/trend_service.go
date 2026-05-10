@@ -5,25 +5,31 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"sync"
 	"time"
 
+	appcache "bilibili-up-admin/internal/cache"
 	"bilibili-up-admin/internal/model"
 	"bilibili-up-admin/internal/repository"
 	appruntime "bilibili-up-admin/internal/runtime"
 	"bilibili-up-admin/pkg/bilibili"
 )
 
-const DefaultTrendCacheTTL = 6 * time.Hour
+const DefaultTrendCacheTTL = 10 * time.Minute
+const DefaultTrendStaleCacheTTL = 24 * time.Hour
 
 const (
-	TagInfoPollMaxPerRun = 20
-	TagInfoPollInterval  = 800 * time.Millisecond
+	TagInfoPollMaxPerRun = 5
+	TagInfoPollInterval  = 1500 * time.Millisecond
 )
 
 // TrendService 热度服务
 type TrendService struct {
-	runtime *appruntime.Store
-	repo    *repository.TagRankingRepository
+	runtime    *appruntime.Store
+	repo       *repository.TagRankingRepository
+	cache      *appcache.TrendCache
+	refreshMu  sync.Mutex
+	refreshing map[string]struct{}
 }
 
 // NewTrendService 创建热度服务
@@ -32,8 +38,10 @@ func NewTrendService(
 	repo *repository.TagRankingRepository,
 ) *TrendService {
 	return &TrendService{
-		runtime: runtime,
-		repo:    repo,
+		runtime:    runtime,
+		repo:       repo,
+		cache:      appcache.NewTrendCache(DefaultTrendCacheTTL, DefaultTrendStaleCacheTTL, log.Printf),
+		refreshing: make(map[string]struct{}),
 	}
 }
 
@@ -53,6 +61,16 @@ type TagRankingResult struct {
 
 // GetTrendingTags 获取热门标签
 func (s *TrendService) GetTrendingTags(ctx context.Context, category string, limit int) ([]bilibili.TrendingTag, error) {
+	fetchLimit := normalizeTrendFetchLimit(category, limit)
+	tags, err := s.fetchTrendingTags(ctx, category, fetchLimit)
+	if err != nil {
+		return nil, err
+	}
+	s.setTrendingTagsCache(category, tags, DefaultTrendCacheTTL, "bilibili-live")
+	return limitTrendingTagsForService(tags, limit), nil
+}
+
+func (s *TrendService) fetchTrendingTags(ctx context.Context, category string, limit int) ([]bilibili.TrendingTag, error) {
 	client, err := s.biliClient()
 	if err != nil {
 		return nil, err
@@ -65,17 +83,55 @@ func (s *TrendService) GetTrendingTags(ctx context.Context, category string, lim
 	if len(tags) == 0 {
 		log.Printf("[trend.tags] fetch empty category=%q limit=%d", category, limit)
 	}
-	return s.enrichTrendingTagsWithStoredInfo(ctx, tags), nil
+	log.Printf("[trend.tags] fetched category=%q limit=%d count=%d", category, limit, len(tags))
+	return tags, nil
 }
 
 // GetTrendingTagsSmart 优先读取缓存，不存在或过期时回源并刷新
 func (s *TrendService) GetTrendingTagsSmart(ctx context.Context, category string, limit int, ttl time.Duration) ([]bilibili.TrendingTag, error) {
-	_ = ttl
-	return s.GetTrendingTags(ctx, category, limit)
+	if ttl <= 0 {
+		ttl = DefaultTrendCacheTTL
+	}
+	fetchLimit := normalizeTrendFetchLimit(category, limit)
+	if tags, status, ok := s.cache.GetTrendingTags(category, limit); ok {
+		if status == appcache.CacheStale {
+			s.refreshTrendingTagsAsync(category, fetchLimit, ttl)
+		}
+		return tags, nil
+	}
+	if rankings, status, ok := s.cache.GetRankings(category, limit); ok {
+		if status == appcache.CacheStale {
+			s.refreshTrendingTagsAsync(category, fetchLimit, ttl)
+		}
+		tags := toTrendingTags(rankings)
+		s.cache.SetTrendingTags(category, tags, ttl, "rankings-cache")
+		return tags, nil
+	}
+	if s.repo != nil {
+		rankings, err := s.repo.GetLatestByCategory(ctx, category, fetchLimit)
+		if err == nil && len(rankings) > 0 {
+			log.Printf("[trend.cache] warm type=tags category=%q count=%d source=db-cold-start", category, len(rankings))
+			s.setRankingsCacheForCategory(category, rankings, ttl, "db-cold-start")
+			s.refreshTrendingTagsAsync(category, fetchLimit, ttl)
+			return limitTrendingTagsForService(toTrendingTags(rankings), limit), nil
+		}
+		if err != nil {
+			log.Printf("[trend.cache] db cold-start failed category=%q limit=%d err=%v", category, fetchLimit, err)
+		}
+	}
+	tags, err := s.fetchTrendingTags(ctx, category, fetchLimit)
+	if err != nil {
+		return nil, err
+	}
+	s.setTrendingTagsCache(category, tags, ttl, "bilibili-sync")
+	return limitTrendingTagsForService(tags, limit), nil
 }
 
 // GetTrendingTagsFromDB 仅返回数据库中最近一次同步的标签信息
 func (s *TrendService) GetTrendingTagsFromDB(ctx context.Context, category string, limit int) ([]bilibili.TrendingTag, error) {
+	if s.repo == nil {
+		return nil, fmt.Errorf("tag ranking repository is not configured")
+	}
 	rankings, err := s.repo.GetLatestByCategory(ctx, category, limit)
 	if err != nil {
 		return nil, err
@@ -84,7 +140,7 @@ func (s *TrendService) GetTrendingTagsFromDB(ctx context.Context, category strin
 }
 
 func (s *TrendService) enrichTrendingTagsWithStoredInfo(ctx context.Context, tags []bilibili.TrendingTag) []bilibili.TrendingTag {
-	if len(tags) == 0 {
+	if s.repo == nil || len(tags) == 0 {
 		return tags
 	}
 	enriched := make([]bilibili.TrendingTag, len(tags))
@@ -122,64 +178,7 @@ func toTrendingTags(rankings []model.TagRanking) []bilibili.TrendingTag {
 	return out
 }
 
-// EnsureLatestTags 确保缓存可用，必要时刷新；返回缓存内容与是否发生刷新
-func (s *TrendService) EnsureLatestTags(ctx context.Context, category string, limit int, ttl time.Duration) ([]model.TagRanking, bool, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	if ttl <= 0 {
-		ttl = DefaultTrendCacheTTL
-	}
-
-	latestAt, err := s.repo.LatestRecordAt(ctx, category)
-	if err == nil && latestAt != nil && time.Since(*latestAt) <= ttl {
-		cached, listErr := s.repo.GetLatestByCategory(ctx, category, limit)
-		if listErr == nil && len(cached) > 0 {
-			return cached, false, nil
-		}
-	}
-
-	tags, fetchErr := s.GetTrendingTags(ctx, category, limit)
-	if fetchErr != nil {
-		cached, listErr := s.repo.GetLatestByCategory(ctx, category, limit)
-		if listErr == nil && len(cached) > 0 {
-			return cached, false, nil
-		}
-		return nil, false, fetchErr
-	}
-	if saveErr := s.SaveTagRankings(ctx, tags); saveErr != nil {
-		return nil, false, saveErr
-	}
-	cached, err := s.repo.GetLatestByCategory(ctx, category, limit)
-	if err != nil {
-		return nil, true, err
-	}
-	return cached, true, nil
-}
-
-// GetTagDetail 获取标签详情
-func (s *TrendService) GetTagDetail(ctx context.Context, tagName string, page, pageSize int) (*bilibili.TagRanking, error) {
-	client, err := s.biliClient()
-	if err != nil {
-		return nil, err
-	}
-	return client.GetTagRanking(ctx, tagName, page, pageSize)
-}
-
-// GetVideoRanking 获取视频排行
-func (s *TrendService) GetVideoRanking(ctx context.Context, category string, limit int) (*bilibili.VideoRanking, error) {
-	client, err := s.biliClient()
-	if err != nil {
-		return nil, err
-	}
-	return client.GetCategoryRanking(ctx, category, limit)
-}
-
-// SaveTagRankings 保存标签排行（各分区内按热度降序分配 rank，保证排名稳定）
-func (s *TrendService) SaveTagRankings(ctx context.Context, tags []bilibili.TrendingTag) error {
-	now := time.Now()
-
-	// 按分区分组，各自按热度降序排列后分配 rank
+func toTagRankings(tags []bilibili.TrendingTag, now time.Time) []model.TagRanking {
 	type catGroup struct{ tags []bilibili.TrendingTag }
 	groups := make(map[string]*catGroup)
 	catOrder := make([]string, 0)
@@ -211,7 +210,201 @@ func (s *TrendService) SaveTagRankings(ctx context.Context, tags []bilibili.Tren
 			})
 		}
 	}
+	return rankings
+}
 
+func normalizeTrendFetchLimit(category string, limit int) int {
+	minLimit := 50
+	if category != "" {
+		minLimit = 30
+	}
+	if limit <= 0 || limit < minLimit {
+		return minLimit
+	}
+	return limit
+}
+
+func limitTrendingTagsForService(tags []bilibili.TrendingTag, limit int) []bilibili.TrendingTag {
+	if limit > 0 && limit < len(tags) {
+		tags = tags[:limit]
+	}
+	out := make([]bilibili.TrendingTag, len(tags))
+	copy(out, tags)
+	return out
+}
+
+func limitTagRankingsForService(rankings []model.TagRanking, limit int) []model.TagRanking {
+	if limit > 0 && limit < len(rankings) {
+		rankings = rankings[:limit]
+	}
+	out := make([]model.TagRanking, len(rankings))
+	copy(out, rankings)
+	return out
+}
+
+func (s *TrendService) setTrendingTagsCache(category string, tags []bilibili.TrendingTag, ttl time.Duration, source string) {
+	if s.cache == nil || len(tags) == 0 {
+		return
+	}
+	s.cache.SetTrendingTags(category, tags, ttl, source)
+	rankings := toTagRankings(tags, time.Now())
+	s.setRankingsCacheForCategory(category, rankings, ttl, source)
+	if category == "" {
+		grouped := make(map[string][]bilibili.TrendingTag)
+		for _, tag := range tags {
+			if tag.Category == "" {
+				continue
+			}
+			grouped[tag.Category] = append(grouped[tag.Category], tag)
+		}
+		for cat, items := range grouped {
+			s.cache.SetTrendingTags(cat, items, ttl, source)
+		}
+	}
+}
+
+func (s *TrendService) setRankingsCacheForCategory(category string, rankings []model.TagRanking, ttl time.Duration, source string) {
+	if s.cache == nil || len(rankings) == 0 {
+		return
+	}
+	if category == "" {
+		s.setRankingsCache(rankings, ttl, source)
+		return
+	}
+	s.cache.SetRankings(category, rankings, ttl, source)
+	s.cache.SetTrendingTags(category, toTrendingTags(rankings), ttl, source)
+}
+
+func (s *TrendService) setRankingsCache(rankings []model.TagRanking, ttl time.Duration, source string) {
+	if s.cache == nil || len(rankings) == 0 {
+		return
+	}
+	s.cache.SetRankings("", rankings, ttl, source)
+	s.cache.SetTrendingTags("", toTrendingTags(rankings), ttl, source)
+	grouped := make(map[string][]model.TagRanking)
+	for _, row := range rankings {
+		if row.Category == "" {
+			continue
+		}
+		grouped[row.Category] = append(grouped[row.Category], row)
+	}
+	for category, items := range grouped {
+		s.cache.SetRankings(category, items, ttl, source)
+		s.cache.SetTrendingTags(category, toTrendingTags(items), ttl, source)
+	}
+}
+
+func (s *TrendService) refreshTrendingTagsAsync(category string, limit int, ttl time.Duration) {
+	key := fmt.Sprintf("%s:%d", category, limit)
+	if !s.beginRefresh(key) {
+		log.Printf("[trend.cache] refresh skipped category=%q limit=%d reason=already_running", category, limit)
+		return
+	}
+	log.Printf("[trend.cache] refresh scheduled category=%q limit=%d", category, limit)
+	go func() {
+		defer s.endRefresh(key)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		tags, err := s.fetchTrendingTags(ctx, category, limit)
+		if err != nil {
+			log.Printf("[trend.cache] refresh failed category=%q limit=%d err=%v", category, limit, err)
+			return
+		}
+		s.setTrendingTagsCache(category, tags, ttl, "bilibili-refresh")
+		log.Printf("[trend.cache] refresh done category=%q limit=%d count=%d", category, limit, len(tags))
+	}()
+}
+
+func (s *TrendService) beginRefresh(key string) bool {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	if _, ok := s.refreshing[key]; ok {
+		return false
+	}
+	s.refreshing[key] = struct{}{}
+	return true
+}
+
+func (s *TrendService) endRefresh(key string) {
+	s.refreshMu.Lock()
+	delete(s.refreshing, key)
+	s.refreshMu.Unlock()
+}
+
+// EnsureLatestTags 确保缓存可用，必要时刷新；返回缓存内容与是否发生刷新
+func (s *TrendService) EnsureLatestTags(ctx context.Context, category string, limit int, ttl time.Duration) ([]model.TagRanking, bool, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if ttl <= 0 {
+		ttl = DefaultTrendCacheTTL
+	}
+
+	if rankings, status, ok := s.cache.GetRankings(category, limit); ok {
+		if status == appcache.CacheStale {
+			s.refreshTrendingTagsAsync(category, normalizeTrendFetchLimit(category, limit), ttl)
+		}
+		return rankings, false, nil
+	}
+	if tags, status, ok := s.cache.GetTrendingTags(category, limit); ok {
+		if status == appcache.CacheStale {
+			s.refreshTrendingTagsAsync(category, normalizeTrendFetchLimit(category, limit), ttl)
+		}
+		rankings := toTagRankings(tags, time.Now())
+		s.cache.SetRankings(category, rankings, ttl, "tags-cache")
+		return rankings, false, nil
+	}
+
+	if s.repo != nil {
+		rankings, err := s.repo.GetLatestByCategory(ctx, category, normalizeTrendFetchLimit(category, limit))
+		if err == nil && len(rankings) > 0 {
+			log.Printf("[trend.cache] warm type=rankings category=%q count=%d source=db-cold-start", category, len(rankings))
+			s.setRankingsCacheForCategory(category, rankings, ttl, "db-cold-start")
+			s.refreshTrendingTagsAsync(category, normalizeTrendFetchLimit(category, limit), ttl)
+			return limitTagRankingsForService(rankings, limit), false, nil
+		}
+		if err != nil {
+			log.Printf("[trend.cache] db rankings cold-start failed category=%q limit=%d err=%v", category, limit, err)
+		}
+	}
+
+	tags, fetchErr := s.fetchTrendingTags(ctx, category, normalizeTrendFetchLimit(category, limit))
+	if fetchErr != nil {
+		return nil, false, fetchErr
+	}
+	s.setTrendingTagsCache(category, tags, ttl, "bilibili-ensure")
+	if saveErr := s.SaveTagRankings(ctx, tags); saveErr != nil {
+		log.Printf("[trend.cache] persist rankings failed category=%q count=%d err=%v", category, len(tags), saveErr)
+	}
+	return limitTagRankingsForService(toTagRankings(tags, time.Now()), limit), true, nil
+}
+
+// GetTagDetail 获取标签详情
+func (s *TrendService) GetTagDetail(ctx context.Context, tagName string, page, pageSize int) (*bilibili.TagRanking, error) {
+	client, err := s.biliClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.GetTagRanking(ctx, tagName, page, pageSize)
+}
+
+// GetVideoRanking 获取视频排行
+func (s *TrendService) GetVideoRanking(ctx context.Context, category string, limit int) (*bilibili.VideoRanking, error) {
+	client, err := s.biliClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.GetCategoryRanking(ctx, category, limit)
+}
+
+// SaveTagRankings 保存标签排行（各分区内按热度降序分配 rank，保证排名稳定）
+func (s *TrendService) SaveTagRankings(ctx context.Context, tags []bilibili.TrendingTag) error {
+	rankings := toTagRankings(tags, time.Now())
+	s.setRankingsCache(rankings, DefaultTrendCacheTTL, "save")
+	if s.repo == nil || len(rankings) == 0 {
+		log.Printf("[trend.cache] persist skipped count=%d reason=repo_unavailable_or_empty", len(rankings))
+		return nil
+	}
 	return s.repo.BatchCreate(ctx, rankings)
 }
 
@@ -221,20 +414,32 @@ func (s *TrendService) SyncTagInfoHotValues(ctx context.Context, limit int) (int
 		limit = 50
 	}
 
-	cached, err := s.repo.GetLatest(ctx, limit)
-	if err != nil {
-		return 0, err
+	cached, _, _ := s.cache.GetRankings("", limit)
+	if len(cached) == 0 {
+		if tags, _, ok := s.cache.GetTrendingTags("", limit); ok {
+			cached = toTagRankings(tags, time.Now())
+		}
+	}
+	if len(cached) == 0 && s.repo != nil {
+		rows, err := s.repo.GetLatest(ctx, limit)
+		if err == nil && len(rows) > 0 {
+			log.Printf("[trend.cache] warm type=taginfo category=%q count=%d source=db-cold-start", "", len(rows))
+			s.setRankingsCache(rows, DefaultTrendCacheTTL, "db-cold-start")
+			cached = rows
+		}
+		if err != nil {
+			log.Printf("[trend.cache] db taginfo cold-start failed limit=%d err=%v", limit, err)
+		}
 	}
 	if len(cached) == 0 {
-		if _, _, ensureErr := s.EnsureLatestTags(ctx, "", limit, DefaultTrendCacheTTL); ensureErr != nil {
+		rankings, _, ensureErr := s.EnsureLatestTags(ctx, "", limit, DefaultTrendCacheTTL)
+		if ensureErr != nil {
 			return 0, ensureErr
 		}
-		cached, err = s.repo.GetLatest(ctx, limit)
-		if err != nil {
-			return 0, err
-		}
+		cached = rankings
 	}
 	if len(cached) == 0 {
+		log.Printf("[trend.cache] taginfo skipped reason=empty_cache limit=%d", limit)
 		return 0, nil
 	}
 
@@ -317,9 +522,15 @@ func (s *TrendService) SyncTagInfoHotValues(ctx context.Context, limit int) (int
 		return 0, fmt.Errorf("sync tag info failed: empty cache")
 	}
 
+	s.setTrendingTagsCache("", tags, DefaultTrendCacheTTL, "taginfo-poll")
+	if refreshed == 0 {
+		log.Printf("[trend.cache] taginfo no_remote_refresh limit=%d cache_count=%d", limit, len(tags))
+		return 0, nil
+	}
 	if err := s.SaveTagRankings(ctx, tags); err != nil {
 		return 0, err
 	}
+	log.Printf("[trend.cache] taginfo refreshed=%d cache_count=%d", refreshed, len(tags))
 	return refreshed, nil
 }
 
@@ -352,10 +563,48 @@ func (s *TrendService) GetHistoricalRankings(ctx context.Context, date string, l
 
 // GetLatestRankings 获取最新排行
 func (s *TrendService) GetLatestRankings(ctx context.Context, category string, limit int) ([]model.TagRanking, error) {
-	if category != "" {
-		return s.repo.GetLatestByCategory(ctx, category, limit)
+	if limit <= 0 {
+		limit = 50
 	}
-	return s.repo.GetLatest(ctx, limit)
+	if rankings, status, ok := s.cache.GetRankings(category, limit); ok {
+		if status == appcache.CacheStale {
+			s.refreshTrendingTagsAsync(category, normalizeTrendFetchLimit(category, limit), DefaultTrendCacheTTL)
+		}
+		return rankings, nil
+	}
+	if tags, status, ok := s.cache.GetTrendingTags(category, limit); ok {
+		if status == appcache.CacheStale {
+			s.refreshTrendingTagsAsync(category, normalizeTrendFetchLimit(category, limit), DefaultTrendCacheTTL)
+		}
+		rankings := toTagRankings(tags, time.Now())
+		s.cache.SetRankings(category, rankings, DefaultTrendCacheTTL, "tags-cache")
+		return limitTagRankingsForService(rankings, limit), nil
+	}
+	if s.repo != nil {
+		var (
+			rankings []model.TagRanking
+			err      error
+		)
+		if category != "" {
+			rankings, err = s.repo.GetLatestByCategory(ctx, category, normalizeTrendFetchLimit(category, limit))
+		} else {
+			rankings, err = s.repo.GetLatest(ctx, normalizeTrendFetchLimit(category, limit))
+		}
+		if err == nil && len(rankings) > 0 {
+			log.Printf("[trend.cache] warm type=latest category=%q count=%d source=db-cold-start", category, len(rankings))
+			s.setRankingsCacheForCategory(category, rankings, DefaultTrendCacheTTL, "db-cold-start")
+			s.refreshTrendingTagsAsync(category, normalizeTrendFetchLimit(category, limit), DefaultTrendCacheTTL)
+			return limitTagRankingsForService(rankings, limit), nil
+		}
+		if err != nil {
+			log.Printf("[trend.cache] db latest cold-start failed category=%q limit=%d err=%v", category, limit, err)
+		}
+	}
+	tags, err := s.GetTrendingTagsSmart(ctx, category, limit, DefaultTrendCacheTTL)
+	if err != nil {
+		return nil, err
+	}
+	return limitTagRankingsForService(toTagRankings(tags, time.Now()), limit), nil
 }
 
 // TrendStats 热度统计

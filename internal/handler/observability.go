@@ -4,22 +4,21 @@ import (
 	"net/http"
 
 	"bilibili-up-admin/internal/polling"
-	"bilibili-up-admin/internal/repository"
 
 	"github.com/gin-gonic/gin"
 )
 
 // ObservabilityHandler 可观测性接口
 type ObservabilityHandler struct {
-	settingRepo *repository.SettingRepository
+	snapshot func() polling.Snapshot
 }
 
-func NewObservabilityHandler(settingRepo *repository.SettingRepository) *ObservabilityHandler {
-	return &ObservabilityHandler{settingRepo: settingRepo}
+func NewObservabilityHandler(snapshot func() polling.Snapshot) *ObservabilityHandler {
+	return &ObservabilityHandler{snapshot: snapshot}
 }
 
 func (h *ObservabilityHandler) PollingStats(c *gin.Context) {
-	if h.settingRepo == nil {
+	if h.snapshot == nil {
 		c.JSON(http.StatusOK, gin.H{
 			"started":      false,
 			"task_count":   0,
@@ -29,12 +28,7 @@ func (h *ObservabilityHandler) PollingStats(c *gin.Context) {
 		return
 	}
 
-	var snapshot polling.Snapshot
-	err := h.settingRepo.GetJSON(c.Request.Context(), polling.SnapshotSettingKey, &snapshot)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
+	snapshot := h.snapshot()
 	if snapshot.GeneratedAt.IsZero() && len(snapshot.Tasks) == 0 && !snapshot.Started {
 		c.JSON(http.StatusOK, gin.H{
 			"started":      false,

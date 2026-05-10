@@ -24,7 +24,7 @@ func (h *TrendHandler) TrendingTags(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "0"))
 	category := c.Query("category")
 
-	tags, err := h.svc.GetTrendingTags(c.Request.Context(), category, limit)
+	tags, err := h.svc.GetTrendingTagsSmart(c.Request.Context(), category, limit, service.DefaultTrendCacheTTL)
 	if err != nil {
 		log.Printf("[trend.tags] category=%q limit=%d err=%v", category, limit, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
