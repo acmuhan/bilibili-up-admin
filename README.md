@@ -317,6 +317,23 @@ go run cmd/server/main.go
 go build -o bili-admin cmd/server/main.go
 ```
 
+## GitHub Container Registry 镜像
+
+推送到 `main` / `master` 或发布 `v*.*.*` 标签时，GitHub Actions 会自动构建 Docker 镜像并发布到 GitHub Packages：
+
+```bash
+docker pull ghcr.io/acmuhan/bilibili-up-admin:latest
+```
+
+可用标签包括：
+
+- `latest`: 默认分支最新镜像
+- `main` / `master`: 对应分支镜像
+- `vX.Y.Z`: Git 标签镜像
+- `sha-xxxxxxx`: 提交 SHA 镜像
+
+使用 `docker-compose.yml` 部署时默认拉取 `ghcr.io/acmuhan/bilibili-up-admin:latest`。
+
 ## 默认配置行为
 
 默认配置来自 `config/config.yaml`，当前默认值很简单：

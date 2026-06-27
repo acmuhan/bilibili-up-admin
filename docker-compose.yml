@@ -1,7 +1,7 @@
 services:
   bilibili-up-admin:
-    # 直接拉取最新镜像，实现快速部署
-    image: guohuiyuan/bilibili-up-admin:latest
+    # 使用 GitHub Container Registry 镜像
+    image: ghcr.io/acmuhan/bilibili-up-admin:latest
     container_name: bilibili-up-admin
     restart: unless-stopped
     ports:
